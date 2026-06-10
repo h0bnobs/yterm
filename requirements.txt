@@ -1,0 +1,5 @@
+# Install into a venv:  python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+textual>=8.0
+yt-dlp>=2025.1.1
+# Needed to read Chromium/Chrome cookies for sign-in on Linux
+secretstorage>=3.3

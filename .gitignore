@@ -1,0 +1,10 @@
+# Python virtualenv (recreate with requirements.txt)
+.venv/
+__pycache__/
+*.pyc
+
+# Local editor / agent settings
+.claude/
+
+# Runtime config written by yterm
+config.json
