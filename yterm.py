@@ -12,8 +12,11 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
+import tempfile
+import time
 import urllib.parse
 
 import yt_dlp
@@ -202,6 +205,87 @@ def fmt_views(n) -> str:
         if n >= div:
             return f"{n / div:.1f}{suffix}".replace(".0", "")
     return str(n)
+
+
+# --------------------------------------------------------------------------
+# In-terminal video layout: a fixed, coloured control footer that mpv is
+# kept out of via a reserved bottom video margin (issue #1)
+# --------------------------------------------------------------------------
+
+FOOTER_ROWS = 2
+FOOTER_BG = "\x1b[48;2;40;46;66m"     # subtle blue-grey, distinct from the bg
+FOOTER_FG = "\x1b[38;2;236;236;245m"
+KEY_HINTS = "q quit · spc pause · ←/→ 5s · ↑/↓ 1m · 9/0 vol · m mute · [ ] speed"
+
+
+def footer_lines(st: dict, title: str, cols: int) -> list[str]:
+    """The two text lines shown in the control footer."""
+    icon = "⏸" if st.get("pause") else "▶"
+    pos = fmt_duration(int(st["time-pos"])) if st.get("time-pos") is not None else "0:00"
+    dur = fmt_duration(int(st["duration"])) if st.get("duration") else "?"
+    pct = f"{int(st['percent-pos'])}%" if st.get("percent-pos") is not None else "0%"
+    vol = f"{int(st['volume'])}" if st.get("volume") is not None else "?"
+    line1 = f" {icon} {pos} / {dur} ({pct})   vol {vol}   {title}"
+    return [line1, " " + KEY_HINTS]
+
+
+def draw_footer(lines_text: list[str], term_lines: int, cols: int) -> None:
+    """Paint the coloured footer band across its reserved bottom rows.
+    Autowrap is disabled so filling the final cell never scrolls."""
+    out = ["\x1b[?7l"]
+    first = term_lines - len(lines_text) + 1
+    for i, text in enumerate(lines_text):
+        cell = (text[:cols]).ljust(cols)
+        out.append(f"\x1b[{first + i};1H{FOOTER_BG}{FOOTER_FG}{cell}\x1b[0m")
+    out.append("\x1b[?7h")
+    sys.stdout.write("".join(out))
+    sys.stdout.flush()
+
+
+class MpvIPC:
+    """Tiny JSON-IPC client for a running mpv (--input-ipc-server)."""
+
+    def __init__(self, path: str):
+        self.sock = socket.socket(socket.AF_UNIX)
+        self.sock.connect(path)
+        self.sock.settimeout(0.4)
+        self.buf = b""
+        self._rid = 0
+
+    def get(self, prop: str):
+        self._rid += 1
+        rid = self._rid
+        try:
+            self.sock.sendall(
+                json.dumps({"command": ["get_property", prop], "request_id": rid}).encode() + b"\n"
+            )
+        except OSError:
+            return None
+        deadline = time.time() + 0.4
+        while time.time() < deadline:
+            try:
+                self.buf += self.sock.recv(65536)
+            except socket.timeout:
+                break
+            except OSError:
+                return None
+            while b"\n" in self.buf:
+                line, self.buf = self.buf.split(b"\n", 1)
+                if not line.strip():
+                    continue
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if msg.get("request_id") == rid:
+                    return msg.get("data") if msg.get("error") == "success" else None
+        return None
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except OSError:
+            pass
 
 
 # --------------------------------------------------------------------------
@@ -510,10 +594,6 @@ class YTerm(App):
         print(f" {mode_desc}"[: cols - 1])
         print(bar)
 
-    def _print_loading_line(self, title: str, mode_desc: str) -> None:
-        cols = shutil.get_terminal_size().columns
-        print(f"▶ {title} │ {mode_desc} │ loading…"[: cols - 1])
-
     def _play(self, mode: str, entry: dict | None = None) -> None:
         if entry is None:
             entry = self.selected_entry()
@@ -544,43 +624,86 @@ class YTerm(App):
             self.set_status(f"playing in window: {title[:60]} (browse continues)")
             return
 
-        cmd.append(f"--term-status-msg={MPV_STATUS}")
         if mode == "audio":
+            cmd.append(f"--term-status-msg={MPV_STATUS}")
             cmd += ["--no-video", "--ytdl-format=bestaudio/best"]
             mode_desc = "audio only"
-        else:
-            # Video fills the pane from the top; mpv's status line — our
-            # control bar — redraws constantly on the row directly below it.
-            size = shutil.get_terminal_size()
-            video_rows = max(size.lines - 2, 4)
-            cmd += [
-                f"--vo={self.vo}",
-                "--profile=sw-fast",
-                f"--ytdl-format=bestvideo[height<={TERM_MAXH}]+bestaudio"
-                f"/best[height<={TERM_MAXH}]/best",
-            ]
-            if self.vo == "tct":
-                cmd.append(f"--vo-tct-height={video_rows}")
-            elif self.vo == "kitty":
-                cmd += ["--vo-kitty-use-shm=yes", f"--vo-kitty-rows={video_rows}", "--vo-kitty-top=1"]
-            mode_desc = f"video {self.vo} ≤{TERM_MAXH}p"
-        if start:
-            mode_desc += f" │ from {fmt_duration(start)}"
-        if self.cookies_browser:
-            mode_desc += f" │ signed in: {self.auth_label()}"
+            if start:
+                mode_desc += f" │ from {fmt_duration(start)}"
+            if self.cookies_browser:
+                mode_desc += f" │ signed in: {self.auth_label()}"
+            cmd.append(url)
+            with self.suspend():
+                os.system("clear")
+                self._print_control_centre(title, mode_desc)
+                try:
+                    subprocess.call(cmd)
+                except KeyboardInterrupt:
+                    pass
+            self.set_status(f"finished: {title[:60]}")
+            return
+
+        # Video: reserve the bottom rows as a video margin so mpv physically
+        # cannot draw there, then paint our own coloured control footer in
+        # that band (issue #1: the video used to overlap the controls).
+        sock = os.path.join(tempfile.gettempdir(), f"yterm-mpv-{os.getpid()}.sock")
+        size = shutil.get_terminal_size()
+        ratio = FOOTER_ROWS / max(size.lines, FOOTER_ROWS + 1)
+        cmd += [
+            f"--vo={self.vo}",
+            "--profile=sw-fast",
+            "--term-status-msg=",
+            f"--input-ipc-server={sock}",
+            f"--video-margin-ratio-bottom={ratio:.4f}",
+            f"--ytdl-format=bestvideo[height<={TERM_MAXH}]+bestaudio"
+            f"/best[height<={TERM_MAXH}]/best",
+        ]
+        if self.vo == "kitty":
+            cmd.append("--vo-kitty-use-shm=yes")
         cmd.append(url)
 
         with self.suspend():
             os.system("clear")
-            if mode == "audio":
-                self._print_control_centre(title, mode_desc)
-            else:
-                self._print_loading_line(title, mode_desc)
             try:
-                subprocess.call(cmd)
+                self._play_video_with_footer(cmd, sock, title)
             except KeyboardInterrupt:
                 pass
+            finally:
+                try:
+                    os.unlink(sock)
+                except OSError:
+                    pass
         self.set_status(f"finished: {title[:60]}")
+
+    def _play_video_with_footer(self, cmd: list[str], sock_path: str, title: str) -> None:
+        """Launch mpv (which keeps clear of the bottom margin) and keep the
+        coloured control footer painted in that reserved band."""
+        size = shutil.get_terminal_size()
+        draw_footer([" loading…", " " + KEY_HINTS], size.lines, size.columns)
+        proc = subprocess.Popen(cmd)
+        ipc = None
+        deadline = time.time() + 15
+        while time.time() < deadline and proc.poll() is None:
+            if os.path.exists(sock_path):
+                try:
+                    ipc = MpvIPC(sock_path)
+                    break
+                except OSError:
+                    pass
+            time.sleep(0.15)
+        props = ("time-pos", "duration", "percent-pos", "volume", "pause")
+        try:
+            while proc.poll() is None:
+                size = shutil.get_terminal_size()
+                st = {p: ipc.get(p) for p in props} if ipc else {}
+                draw_footer(footer_lines(st, title, size.columns), size.lines, size.columns)
+                time.sleep(0.25)
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            if ipc:
+                ipc.close()
+            proc.wait()
 
 
 def main() -> None:
