@@ -32,7 +32,21 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 VENV_YTDLP = os.path.join(HERE, ".venv", "bin", "yt-dlp")
 CONFIG_PATH = os.path.expanduser("~/.config/yterm/config.json")
 COOKIES_FILE = os.path.expanduser("~/.config/yterm/cookies.txt")
+INPUT_CONF_PATH = os.path.expanduser("~/.config/yterm/input.conf")
+# Up/Down adjust volume by 5%; other keys keep mpv's defaults.
+INPUT_CONF = "UP add volume 5\nDOWN add volume -5\n"
 SEARCH_LIMIT = 25
+
+
+def ensure_input_conf() -> str:
+    """Write yterm's mpv key bindings and return the file path."""
+    try:
+        os.makedirs(os.path.dirname(INPUT_CONF_PATH), exist_ok=True)
+        with open(INPUT_CONF_PATH, "w") as f:
+            f.write(INPUT_CONF)
+    except OSError:
+        pass
+    return INPUT_CONF_PATH
 
 # Max source height for in-terminal playback. Terminal pixel area rarely
 # exceeds ~720p worth of detail; raise via YTERM_MAXHEIGHT if wanted.
@@ -58,7 +72,7 @@ FEEDS = {
 MPV_STATUS = (
     "${?pause==yes:⏸ }${!pause==yes:▶ }"
     "${time-pos} / ${duration} (${percent-pos}%)  vol ${volume}"
-    " │ q quit · spc pause · ←/→ 5s · ↑/↓ 1m · 9/0 vol · m mute · [ ] speed"
+    " │ q quit · spc pause · ←/→ 5s · ↑/↓ vol 5% · m mute · [ ] speed"
 )
 
 HELP_TEXT = """\
@@ -81,8 +95,8 @@ HELP_TEXT = """\
 [b]During playback (mpv owns the terminal)[/b]
   q        stop, return to browser
   space    pause / resume
-  ←/→      seek 5 s        ↑/↓   seek 1 min
-  9/0      volume          m     mute
+  ←/→      seek 5 s        ↑/↓   volume ±5%
+  m        mute            9/0   volume (mpv default)
   [ / ]    playback speed  ,/.   frame step (paused)
 
 [b]Quality[/b]
@@ -215,7 +229,7 @@ def fmt_views(n) -> str:
 FOOTER_ROWS = 2
 FOOTER_BG = "\x1b[48;2;40;46;66m"     # subtle blue-grey, distinct from the bg
 FOOTER_FG = "\x1b[38;2;236;236;245m"
-KEY_HINTS = "q quit · spc pause · ←/→ 5s · ↑/↓ 1m · 9/0 vol · m mute · [ ] speed"
+KEY_HINTS = "q quit · spc pause · ←/→ 5s · ↑/↓ vol 5% · m mute · [ ] speed"
 
 
 def footer_lines(st: dict, title: str, cols: int) -> list[str]:
@@ -575,7 +589,8 @@ class YTerm(App):
             self.set_status("mpv is not installed — install it and restart yterm")
             return None
         # statusline=status keeps the control bar visible while muting other noise
-        cmd = [mpv, "--osc=no", "--msg-level=all=error,statusline=status", "--term-osd-bar=no"]
+        cmd = [mpv, "--osc=no", "--msg-level=all=error,statusline=status", "--term-osd-bar=no",
+               f"--input-conf={ensure_input_conf()}"]
         if os.path.exists(VENV_YTDLP):
             cmd.append(f"--script-opts=ytdl_hook-ytdl_path={VENV_YTDLP}")
         if self.cookies_browser == "file":
