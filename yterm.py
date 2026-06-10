@@ -33,8 +33,16 @@ VENV_YTDLP = os.path.join(HERE, ".venv", "bin", "yt-dlp")
 CONFIG_PATH = os.path.expanduser("~/.config/yterm/config.json")
 COOKIES_FILE = os.path.expanduser("~/.config/yterm/cookies.txt")
 INPUT_CONF_PATH = os.path.expanduser("~/.config/yterm/input.conf")
-# Up/Down adjust volume by 5%; other keys keep mpv's defaults.
-INPUT_CONF = "UP add volume 5\nDOWN add volume -5\n"
+# Up/Down adjust volume by 5%; Ctrl+Up/Down change quality by signalling
+# yterm through an mpv user-data property. Everything else keeps mpv defaults.
+INPUT_CONF = (
+    "UP add volume 5\n"
+    "DOWN add volume -5\n"
+    "Ctrl+UP set user-data/yterm/req up\n"
+    "Ctrl+DOWN set user-data/yterm/req down\n"
+)
+# Selectable height caps for the in-terminal stream, lowest to highest.
+QUALITY_CAPS = [144, 240, 360, 480, 720, 1080]
 SEARCH_LIMIT = 25
 
 
@@ -95,14 +103,15 @@ HELP_TEXT = """\
 [b]During playback (mpv owns the terminal)[/b]
   q        stop, return to browser
   space    pause / resume
-  ←/→      seek 5 s        ↑/↓   volume ±5%
-  m        mute            9/0   volume (mpv default)
-  [ / ]    playback speed  ,/.   frame step (paused)
+  ←/→       seek 5 s         ↑/↓   volume ±5%
+  Ctrl+↑/↓  raise/lower quality (reloads in place)
+  m         mute             [ / ] playback speed   ,/. frame step
 
 [b]Quality[/b]
-  In-terminal streams are capped at {maxh}p (YTERM_MAXHEIGHT to change).
-  Terminal graphics are the limit — press o for true full quality.
-""".format(maxh=TERM_MAXH)
+  The footer shows the live resolution. Ctrl+↑/↓ lower or raise the height
+  cap (144-1080p) and reload in place, keeping your position; the choice is
+  remembered next time. Press o for a full-quality mpv window.
+"""
 
 
 # --------------------------------------------------------------------------
@@ -229,7 +238,7 @@ def fmt_views(n) -> str:
 FOOTER_ROWS = 2
 FOOTER_BG = "\x1b[48;2;40;46;66m"     # subtle blue-grey, distinct from the bg
 FOOTER_FG = "\x1b[38;2;236;236;245m"
-KEY_HINTS = "q quit · spc pause · ←/→ 5s · ↑/↓ vol 5% · m mute · [ ] speed"
+KEY_HINTS = "q quit · spc pause · ←/→ 5s · ↑/↓ vol · ⌃↑/↓ quality · m mute · [ ] speed"
 
 
 def footer_lines(st: dict, title: str, cols: int) -> list[str]:
@@ -239,7 +248,11 @@ def footer_lines(st: dict, title: str, cols: int) -> list[str]:
     dur = fmt_duration(int(st["duration"])) if st.get("duration") else "?"
     pct = f"{int(st['percent-pos'])}%" if st.get("percent-pos") is not None else "0%"
     vol = f"{int(st['volume'])}" if st.get("volume") is not None else "?"
-    line1 = f" {icon} {pos} / {dur} ({pct})   vol {vol}   {title}"
+    w, h = st.get("width"), st.get("height")
+    res = f"{w}x{h}" if w and h else "…"
+    cap = st.get("cap")
+    capstr = f" (cap ≤{cap}p)" if cap else ""
+    line1 = f" {icon} {pos} / {dur} ({pct})   vol {vol}   {res}{capstr}   {title}"
     return [line1, " " + KEY_HINTS]
 
 
@@ -294,6 +307,13 @@ class MpvIPC:
                 if msg.get("request_id") == rid:
                     return msg.get("data") if msg.get("error") == "success" else None
         return None
+
+    def command(self, cmd: list) -> None:
+        """Fire a command without waiting for its reply."""
+        try:
+            self.sock.sendall(json.dumps({"command": cmd}).encode() + b"\n")
+        except OSError:
+            pass
 
     def close(self) -> None:
         try:
@@ -407,6 +427,8 @@ class YTerm(App):
         self.entries: list[dict] = []
         self.cfg = load_config()
         self.cookies_browser: str | None = self.cfg.get("cookies_browser")
+        cap = int(self.cfg.get("quality_cap", TERM_MAXH))
+        self.quality_cap = min(QUALITY_CAPS, key=lambda c: abs(c - cap))
 
     def compose(self) -> ComposeResult:
         yield Input(
@@ -658,59 +680,104 @@ class YTerm(App):
             self.set_status(f"finished: {title[:60]}")
             return
 
-        # Video: reserve the bottom rows as a video margin so mpv physically
-        # cannot draw there, then paint our own coloured control footer in
-        # that band (issue #1: the video used to overlap the controls).
-        sock = os.path.join(tempfile.gettempdir(), f"yterm-mpv-{os.getpid()}.sock")
-        size = shutil.get_terminal_size()
-        ratio = FOOTER_ROWS / max(size.lines, FOOTER_ROWS + 1)
+        # Video: a coloured control footer mpv can't overdraw (issue #1), with
+        # a live resolution readout and a Ctrl+Up/Down quality toggle (issue #2).
+        with self.suspend():
+            os.system("clear")
+            try:
+                self._play_video_with_footer(url, title, start)
+            except KeyboardInterrupt:
+                pass
+        self.set_status(f"finished: {title[:60]}")
+
+    def _video_cmd(self, url: str, cap: int, start: int, sock: str) -> list[str] | None:
+        cmd = self._mpv_base()
+        if cmd is None:
+            return None
+        lines = shutil.get_terminal_size().lines
+        ratio = FOOTER_ROWS / max(lines, FOOTER_ROWS + 1)
         cmd += [
             f"--vo={self.vo}",
             "--profile=sw-fast",
             "--term-status-msg=",
             f"--input-ipc-server={sock}",
             f"--video-margin-ratio-bottom={ratio:.4f}",
-            f"--ytdl-format=bestvideo[height<={TERM_MAXH}]+bestaudio"
-            f"/best[height<={TERM_MAXH}]/best",
+            f"--ytdl-format=bestvideo[height<={cap}]+bestaudio"
+            f"/best[height<={cap}]/best",
         ]
         if self.vo == "kitty":
             cmd.append("--vo-kitty-use-shm=yes")
+        if start:
+            cmd.append(f"--start={int(start)}")
         cmd.append(url)
+        return cmd
 
-        with self.suspend():
-            os.system("clear")
-            try:
-                self._play_video_with_footer(cmd, sock, title)
-            except KeyboardInterrupt:
-                pass
-            finally:
-                try:
-                    os.unlink(sock)
-                except OSError:
-                    pass
-        self.set_status(f"finished: {title[:60]}")
-
-    def _play_video_with_footer(self, cmd: list[str], sock_path: str, title: str) -> None:
-        """Launch mpv (which keeps clear of the bottom margin) and keep the
-        coloured control footer painted in that reserved band."""
-        size = shutil.get_terminal_size()
-        draw_footer([" loading…", " " + KEY_HINTS], size.lines, size.columns)
-        proc = subprocess.Popen(cmd)
-        ipc = None
-        deadline = time.time() + 15
-        while time.time() < deadline and proc.poll() is None:
-            if os.path.exists(sock_path):
-                try:
-                    ipc = MpvIPC(sock_path)
-                    break
-                except OSError:
-                    pass
-            time.sleep(0.15)
-        props = ("time-pos", "duration", "percent-pos", "volume", "pause")
+    def _next_cap(self, cap: int, direction: str) -> int:
         try:
-            while proc.poll() is None:
-                size = shutil.get_terminal_size()
+            i = QUALITY_CAPS.index(cap)
+        except ValueError:
+            i = min(range(len(QUALITY_CAPS)), key=lambda k: abs(QUALITY_CAPS[k] - cap))
+        i = max(0, i - 1) if direction == "down" else min(len(QUALITY_CAPS) - 1, i + 1)
+        return QUALITY_CAPS[i]
+
+    def _persist_quality(self) -> None:
+        if self.cfg.get("quality_cap") != self.quality_cap:
+            self.cfg["quality_cap"] = self.quality_cap
+            save_config(self.cfg)
+
+    def _play_video_with_footer(self, url: str, title: str, start: int) -> None:
+        """Launch mpv with a control footer it cannot overdraw, a live
+        resolution readout, and a Ctrl+Up/Down quality toggle that reloads
+        the stream at the new cap while preserving the playback position."""
+        sock = os.path.join(tempfile.gettempdir(), f"yterm-mpv-{os.getpid()}.sock")
+
+        def launch(cap: int, pos: float):
+            try:
+                os.unlink(sock)
+            except OSError:
+                pass
+            size = shutil.get_terminal_size()
+            draw_footer([f" loading… (≤{cap}p)", " " + KEY_HINTS], size.lines, size.columns)
+            cmd = self._video_cmd(url, cap, int(pos), sock)
+            if cmd is None:
+                return None, None
+            proc = subprocess.Popen(cmd)
+            ipc = None
+            deadline = time.time() + 15
+            while time.time() < deadline and proc.poll() is None:
+                if os.path.exists(sock):
+                    try:
+                        ipc = MpvIPC(sock)
+                        break
+                    except OSError:
+                        pass
+                time.sleep(0.15)
+            return proc, ipc
+
+        proc, ipc = launch(self.quality_cap, start)
+        props = ("time-pos", "duration", "percent-pos", "volume", "pause", "width", "height")
+        try:
+            while proc is not None and proc.poll() is None:
                 st = {p: ipc.get(p) for p in props} if ipc else {}
+                req = ipc.get("user-data/yterm/req") if ipc else None
+                if req in ("up", "down"):
+                    if ipc:
+                        ipc.command(["set_property", "user-data/yterm/req", "none"])
+                    new_cap = self._next_cap(self.quality_cap, req)
+                    if new_cap != self.quality_cap:
+                        pos = st.get("time-pos") or 0
+                        self.quality_cap = new_cap
+                        if ipc:
+                            ipc.close()
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                        proc, ipc = launch(new_cap, pos)
+                    continue
+                st["cap"] = self.quality_cap
+                size = shutil.get_terminal_size()
                 draw_footer(footer_lines(st, title, size.columns), size.lines, size.columns)
                 time.sleep(0.25)
         except (BrokenPipeError, OSError):
@@ -718,7 +785,16 @@ class YTerm(App):
         finally:
             if ipc:
                 ipc.close()
-            proc.wait()
+            if proc:
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+            try:
+                os.unlink(sock)
+            except OSError:
+                pass
+            self._persist_quality()
 
 
 def main() -> None:
