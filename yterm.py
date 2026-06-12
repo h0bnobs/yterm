@@ -185,6 +185,39 @@ def is_url(text: str) -> bool:
     return text.startswith("http://") or text.startswith("https://")
 
 
+def parse_video_id(url_or_id: str) -> str | None:
+    """Best-effort YouTube video id from a bare id or a watch / youtu.be /
+    shorts / embed URL. Returns None for anything that isn't recognisably
+    a YouTube video (related suggestions are a YouTube feature)."""
+    if not url_or_id:
+        return None
+    if re.fullmatch(r"[\w-]{11}", url_or_id):
+        return url_or_id
+    parsed = urllib.parse.urlparse(url_or_id)
+    host = parsed.netloc.lower()
+    if host.endswith("youtu.be"):
+        seg = parsed.path.lstrip("/").split("/")[0]
+        return seg if re.fullmatch(r"[\w-]{11}", seg) else None
+    if "youtube" in host:
+        v = urllib.parse.parse_qs(parsed.query).get("v")
+        if v and re.fullmatch(r"[\w-]{11}", v[0]):
+            return v[0]
+        m = re.search(r"/(?:shorts|embed)/([\w-]{11})", parsed.path)
+        if m:
+            return m.group(1)
+    return None
+
+
+def entry_video_id(entry: dict) -> str | None:
+    return parse_video_id(entry.get("id") or "") or parse_video_id(entry.get("url") or "")
+
+
+def related_target(vid: str) -> str:
+    """YouTube's RD 'mix'/radio playlist seeded by a video is a reliable
+    source of related suggestions via a fast flat extract."""
+    return f"https://www.youtube.com/watch?v={vid}&list=RD{vid}"
+
+
 def parse_time_token(v: str) -> int:
     """'1322', '1322s', '22m2s', '1h2m3s', '01:23', '1:02:03' -> seconds."""
     v = v.strip()
@@ -419,6 +452,7 @@ class YTerm(App):
         Binding("a", "play_audio", "Audio"),
         Binding("o", "play_window", "Window"),
         Binding("c", "browse_channel", "Channel"),
+        Binding("n", "related", "Up next"),
         Binding("g", "toggle_hwdec", "GPU"),
         Binding("s", "sign_in", "Sign in"),
         Binding("u", "feed('subscriptions')", "Subs", show=False),
@@ -439,6 +473,7 @@ class YTerm(App):
         cap = int(self.cfg.get("quality_cap", TERM_MAXH))
         self.quality_cap = min(QUALITY_CAPS, key=lambda c: abs(c - cap))
         self.hwdec = bool(self.cfg.get("hwdec", False))
+        self._related_cache: dict[str, list[dict]] = {}
 
     def compose(self) -> ComposeResult:
         yield Input(
@@ -572,6 +607,42 @@ class YTerm(App):
             self.set_status("no channel link on this result")
             return
         self.start_load(url.rstrip("/") + "/videos", f"channel {name}")
+
+    # -- suggestions / up next ---------------------------------------------
+
+    def action_related(self) -> None:
+        if self.in_input():
+            return
+        entry = self.selected_entry()
+        if entry:
+            self.load_related(entry)
+
+    def load_related(self, entry: dict) -> None:
+        """Load related suggestions for a video into the results list."""
+        vid = entry_video_id(entry)
+        if not vid:
+            self.set_status("no suggestions available for this item")
+            return
+        title = (entry.get("title") or "this video")[:50]
+        self.query_one(DataTable).loading = True
+        self.set_status(f"loading up next · {title}…")
+        self.run_related(vid, title)
+
+    @work(thread=True, exclusive=True)
+    def run_related(self, vid: str, title: str) -> None:
+        entries = self._related_cache.get(vid)
+        if entries is None:
+            try:
+                entries = _flat_extract(related_target(vid), self.cookies_browser)
+            except Exception as exc:
+                msg = str(exc).split("\n")[0][:120]
+                self.call_from_thread(self.set_status, f"up next failed: {msg}")
+                self.call_from_thread(setattr, self.query_one(DataTable), "loading", False)
+                return
+            # The mix is seeded by the video itself — drop it from suggestions.
+            entries = [e for e in entries if entry_video_id(e) != vid]
+            self._related_cache[vid] = entries
+        self.call_from_thread(self.populate, entries, f"up next · related to {title}")
 
     def action_toggle_hwdec(self) -> None:
         if self.in_input():
