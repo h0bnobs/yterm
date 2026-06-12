@@ -89,7 +89,9 @@ HELP_TEXT = """\
            (a &t=90s / &t=1h2m3s timestamp starts playback there)
   Enter    stream selected video in the terminal
   a        play audio only
-  o        open in an mpv window (full quality, browse continues)
+  o        play in the reusable mpv window (replaces it) — search stays live
+  e        enqueue the selected video after the one in the window
+  x        stop the window player
   c        list the selected video's channel uploads
   n        up next — related suggestions for the selected video
   g        toggle GPU / hardware decoding (off by default)
@@ -108,6 +110,13 @@ HELP_TEXT = """\
   ←/→       seek 5 s         ↑/↓   volume ±5%
   Ctrl+↑/↓  raise/lower quality (reloads in place)
   m         mute             [ / ] playback speed   ,/. frame step
+
+[b]Search while playing[/b]
+  Enter takes over the terminal, so to keep searching press o to play in a
+  reusable mpv window instead. The TUI stays live: search, press n for
+  suggestions, then o on another result to swap it into the same window, or
+  e to queue it next. x stops the window. The status bar shows what is
+  playing while the window is open.
 
 [b]Up next / suggestions[/b]
   n loads related videos for the highlighted result, and when an
