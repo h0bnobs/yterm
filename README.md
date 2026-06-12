@@ -20,6 +20,7 @@ yterm
 | `a`     | Play audio only                                         |
 | `o`     | Open in an mpv window — full quality, browsing continues|
 | `c`     | Browse the selected video's channel uploads             |
+| `g`     | Toggle GPU / hardware decoding (off by default)         |
 | `s`     | Sign in / out (browser cookies or cookies.txt)          |
 | `u`     | Subscriptions feed (signed in)                          |
 | `r`     | Recommended feed (signed in)                            |
@@ -71,6 +72,15 @@ graphics protocol, full pixel resolution) when running in kitty, otherwise
 For sharp video, run yterm inside kitty, or press `o` on any video for a real
 mpv window at up to 1080p. In-terminal streams fetch up to 720p
 (`YTERM_MAXHEIGHT` to change).
+
+## GPU / hardware decoding
+
+Press `g` to toggle hardware decoding (`--hwdec=auto-safe`). It is off by
+default and the choice is remembered in the config file. Turning it on lowers
+CPU during the decode stage and helps the windowed (`o`) path most. For
+in-terminal video the decoded frames still have to be copied back to the CPU
+to be drawn through the terminal graphics protocol, so the saving there is
+smaller. Try it if in-terminal playback is choppy or your CPU runs hot.
 
 ## Internals
 

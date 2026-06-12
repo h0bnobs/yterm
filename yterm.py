@@ -91,6 +91,7 @@ HELP_TEXT = """\
   a        play audio only
   o        open in an mpv window (full quality, browse continues)
   c        list the selected video's channel uploads
+  g        toggle GPU / hardware decoding (off by default)
   s        sign in / out (browser cookies)
   u        subscriptions feed        (signed in)
   r        recommended feed          (signed in)
@@ -111,6 +112,13 @@ HELP_TEXT = """\
   The footer shows the live resolution. Ctrl+↑/↓ lower or raise the height
   cap (144-1080p) and reload in place, keeping your position; the choice is
   remembered next time. Press o for a full-quality mpv window.
+
+[b]GPU / hardware decoding[/b]
+  g toggles hardware decoding (--hwdec=auto-safe) on or off; the choice is
+  remembered. It lowers CPU during decode and helps the o window most. For
+  in-terminal video the frames still copy back to the CPU to be drawn, so
+  the gain there is smaller. Off by default — turn it on if playback is
+  choppy or CPU runs hot.
 """
 
 
@@ -411,6 +419,7 @@ class YTerm(App):
         Binding("a", "play_audio", "Audio"),
         Binding("o", "play_window", "Window"),
         Binding("c", "browse_channel", "Channel"),
+        Binding("g", "toggle_hwdec", "GPU"),
         Binding("s", "sign_in", "Sign in"),
         Binding("u", "feed('subscriptions')", "Subs", show=False),
         Binding("r", "feed('recommended')", "Recs", show=False),
@@ -429,6 +438,7 @@ class YTerm(App):
         self.cookies_browser: str | None = self.cfg.get("cookies_browser")
         cap = int(self.cfg.get("quality_cap", TERM_MAXH))
         self.quality_cap = min(QUALITY_CAPS, key=lambda c: abs(c - cap))
+        self.hwdec = bool(self.cfg.get("hwdec", False))
 
     def compose(self) -> ComposeResult:
         yield Input(
@@ -463,7 +473,8 @@ class YTerm(App):
         vo = self.vo
         if vo == "tct":
             vo += " (block art — run yterm inside kitty for sharp video, or o for a window)"
-        self.set_status(f"video: {vo} ≤{TERM_MAXH}p │ {auth} │ ? for all keys")
+        decode = "gpu" if self.hwdec else "cpu"
+        self.set_status(f"video: {vo} ≤{TERM_MAXH}p · decode {decode} │ {auth} │ ? for all keys")
 
     def in_input(self) -> bool:
         return isinstance(self.focused, Input)
@@ -562,6 +573,21 @@ class YTerm(App):
             return
         self.start_load(url.rstrip("/") + "/videos", f"channel {name}")
 
+    def action_toggle_hwdec(self) -> None:
+        if self.in_input():
+            return
+        self.hwdec = not self.hwdec
+        self.cfg["hwdec"] = self.hwdec
+        save_config(self.cfg)
+        self.refresh_idle_status()
+        if self.hwdec:
+            self.set_status(
+                "GPU/hardware decoding on — lower CPU on decode and in the o window; "
+                "in-terminal frames still copy back to CPU. Applies to the next video."
+            )
+        else:
+            self.set_status("GPU/hardware decoding off — software decode (sw-fast)")
+
     # -- sign in -----------------------------------------------------------
 
     def action_sign_in(self) -> None:
@@ -621,6 +647,14 @@ class YTerm(App):
             cmd.append(f"--ytdl-raw-options-append=cookies-from-browser={self.cookies_browser}")
         return cmd
 
+    def _decode_flags(self) -> list[str]:
+        """Decode/scale flags shared by the video paths. With GPU decoding on
+        we let mpv pick a safe hardware decoder; otherwise the fast software
+        profile keeps CPU scaling cheap for terminal output."""
+        if self.hwdec:
+            return ["--hwdec=auto-safe"]
+        return ["--profile=sw-fast"]
+
     def _print_control_centre(self, title: str, mode_desc: str) -> None:
         cols = shutil.get_terminal_size().columns
         bar = "─" * min(cols - 1, 110)
@@ -647,6 +681,8 @@ class YTerm(App):
             cmd.append(f"--start={start}")
 
         if mode == "window":
+            if self.hwdec:
+                cmd.append("--hwdec=auto-safe")
             cmd += [
                 f"--ytdl-format=bestvideo[height<={WINDOW_MAXH}]+bestaudio"
                 f"/best[height<={WINDOW_MAXH}]/best",
@@ -698,13 +734,13 @@ class YTerm(App):
         ratio = FOOTER_ROWS / max(lines, FOOTER_ROWS + 1)
         cmd += [
             f"--vo={self.vo}",
-            "--profile=sw-fast",
             "--term-status-msg=",
             f"--input-ipc-server={sock}",
             f"--video-margin-ratio-bottom={ratio:.4f}",
             f"--ytdl-format=bestvideo[height<={cap}]+bestaudio"
             f"/best[height<={cap}]/best",
         ]
+        cmd += self._decode_flags()
         if self.vo == "kitty":
             cmd.append("--vo-kitty-use-shm=yes")
         if start:
