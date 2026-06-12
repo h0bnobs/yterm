@@ -487,6 +487,11 @@ class YTerm(App):
         self.quality_cap = min(QUALITY_CAPS, key=lambda c: abs(c - cap))
         self.hwdec = bool(self.cfg.get("hwdec", False))
         self._related_cache: dict[str, list[dict]] = {}
+        # A single reusable mpv window we drive over IPC, so the TUI stays
+        # interactive for searching while a video plays (issue #5).
+        self._win_proc: subprocess.Popen | None = None
+        self._win_sock: str | None = None
+        self._win_title: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Input(
@@ -750,6 +755,78 @@ class YTerm(App):
             return ["--hwdec=auto-safe"]
         return ["--profile=sw-fast"]
 
+    # -- reusable window player (search while playing, issue #5) -----------
+
+    def _window_play(self, entry: dict, append: bool = False) -> None:
+        """Play in a single reusable mpv window. If one is already running we
+        drive it over IPC (replace, or append-play to queue) so the search box
+        stays available; otherwise we spawn the window."""
+        url = entry["url"]
+        title = entry.get("title") or url
+        start = int(entry.get("start") or 0)
+        if self._win_proc and self._win_proc.poll() is None and \
+                self._window_loadfile(url, start, append):
+            if not append:
+                self._win_title = title
+            verb = "queued" if append else "now playing"
+            self.set_status(f"{verb} in window: {title[:55]} — keep searching, the TUI stays live")
+            return
+        self._spawn_window(url, title, start)
+
+    def _window_loadfile(self, url: str, start: int, append: bool) -> bool:
+        """Tell the running window to load a URL. Returns False if it could
+        not be reached, so the caller can spawn a fresh window instead."""
+        sock = self._win_sock
+        if not sock:
+            return False
+        mode = "append-play" if append else "replace"
+        deadline = time.time() + 1.5  # the socket may lag a just-spawned mpv
+        while time.time() < deadline:
+            if os.path.exists(sock):
+                try:
+                    ipc = MpvIPC(sock)
+                except OSError:
+                    time.sleep(0.1)
+                    continue
+                args = ["loadfile", url, mode]
+                if start:
+                    args.append(f"start={start}")  # 3rd arg is options on mpv <= 0.37
+                ipc.command(args)
+                ipc.close()
+                return True
+            time.sleep(0.1)
+        return False
+
+    def _spawn_window(self, url: str, title: str, start: int) -> None:
+        cmd = self._mpv_base()
+        if cmd is None:
+            return
+        sock = os.path.join(tempfile.gettempdir(), f"yterm-window-{os.getpid()}.sock")
+        try:
+            os.unlink(sock)
+        except OSError:
+            pass
+        if self.hwdec:
+            cmd.append("--hwdec=auto-safe")
+        cmd += [
+            "--idle=yes", "--force-window=yes",  # persist as a player between videos
+            f"--input-ipc-server={sock}",
+            "--title=yterm ▶ ${media-title}",
+            f"--ytdl-format=bestvideo[height<={WINDOW_MAXH}]+bestaudio"
+            f"/best[height<={WINDOW_MAXH}]/best",
+        ]
+        if start:
+            cmd.append(f"--start={start}")
+        cmd.append(url)
+        self._win_proc = subprocess.Popen(
+            cmd, start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        self._win_sock = sock
+        self._win_title = title
+        self.set_status(f"now playing in window: {title[:55]} — keep searching, the TUI stays live")
+
     def _print_control_centre(self, title: str, mode_desc: str) -> None:
         cols = shutil.get_terminal_size().columns
         bar = "─" * min(cols - 1, 110)
@@ -776,20 +853,7 @@ class YTerm(App):
             cmd.append(f"--start={start}")
 
         if mode == "window":
-            if self.hwdec:
-                cmd.append("--hwdec=auto-safe")
-            cmd += [
-                f"--ytdl-format=bestvideo[height<={WINDOW_MAXH}]+bestaudio"
-                f"/best[height<={WINDOW_MAXH}]/best",
-                f"--title=yterm: {title}",
-                url,
-            ]
-            subprocess.Popen(
-                cmd, start_new_session=True,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-            self.set_status(f"playing in window: {title[:60]} (browse continues)")
+            self._window_play(entry)
             return
 
         if mode == "audio":
