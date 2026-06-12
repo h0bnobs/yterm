@@ -411,6 +411,7 @@ class YTerm(App):
         Binding("a", "play_audio", "Audio"),
         Binding("o", "play_window", "Window"),
         Binding("c", "browse_channel", "Channel"),
+        Binding("g", "toggle_hwdec", "GPU"),
         Binding("s", "sign_in", "Sign in"),
         Binding("u", "feed('subscriptions')", "Subs", show=False),
         Binding("r", "feed('recommended')", "Recs", show=False),
@@ -464,7 +465,8 @@ class YTerm(App):
         vo = self.vo
         if vo == "tct":
             vo += " (block art — run yterm inside kitty for sharp video, or o for a window)"
-        self.set_status(f"video: {vo} ≤{TERM_MAXH}p │ {auth} │ ? for all keys")
+        decode = "gpu" if self.hwdec else "cpu"
+        self.set_status(f"video: {vo} ≤{TERM_MAXH}p · decode {decode} │ {auth} │ ? for all keys")
 
     def in_input(self) -> bool:
         return isinstance(self.focused, Input)
@@ -562,6 +564,21 @@ class YTerm(App):
             self.set_status("no channel link on this result")
             return
         self.start_load(url.rstrip("/") + "/videos", f"channel {name}")
+
+    def action_toggle_hwdec(self) -> None:
+        if self.in_input():
+            return
+        self.hwdec = not self.hwdec
+        self.cfg["hwdec"] = self.hwdec
+        save_config(self.cfg)
+        self.refresh_idle_status()
+        if self.hwdec:
+            self.set_status(
+                "GPU/hardware decoding on — lower CPU on decode and in the o window; "
+                "in-terminal frames still copy back to CPU. Applies to the next video."
+            )
+        else:
+            self.set_status("GPU/hardware decoding off — software decode (sw-fast)")
 
     # -- sign in -----------------------------------------------------------
 
