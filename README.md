@@ -52,12 +52,13 @@ Any `http(s)` URL yt-dlp supports will play, not just YouTube.
 During playback the video fills the pane from the top and a constantly
 redrawn control bar sits directly under it, showing position / duration,
 volume and the live resolution. Key hints: `q` quit, `space` pause, `←/→`
-seek 5 s, `↑/↓` volume ±5%, `Ctrl+↑/↓` lower/raise quality, `Ctrl+←/→`
-previous/next related video, `m` mute, `[ ]` speed.
+seek 5 s, `↑/↓` volume ±5%, `Ctrl+↑/↓` lower/raise quality, `n`/`b`
+next/previous related video, `m` mute, `[ ]` speed.
 
-`Ctrl+←/→` is autoplay without leaving the terminal: `Ctrl+→` jumps to the
-next related video (pulled from the current video's suggestions) and
-`Ctrl+←` steps back, each reloading in place at your chosen quality.
+`n` / `b` are autoplay without leaving the terminal: `n` jumps to the next
+related video (pulled from the current video's suggestions) and `b` steps
+back, each reloading in place at your chosen quality. `Ctrl+→` / `Ctrl+←`
+do the same, for terminals that intercept the plain letters.
 
 ## Sign in
 
@@ -94,8 +95,8 @@ This windowed player also runs at up to 1080p and obeys the GPU decoding
 toggle, so it doubles as the high-quality way to watch.
 
 If you would rather stay in the terminal, in-terminal playback has its own
-autoplay: while a video plays, `Ctrl+→` and `Ctrl+←` step through its
-related videos in place without returning to the browser.
+autoplay: while a video plays, `n` and `b` (or `Ctrl+→` / `Ctrl+←`) step
+through its related videos in place without returning to the browser.
 
 ## Up next / suggestions
 
