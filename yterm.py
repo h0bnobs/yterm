@@ -40,6 +40,12 @@ INPUT_CONF = (
     "DOWN add volume -5\n"
     "Ctrl+UP set user-data/yterm/req up\n"
     "Ctrl+DOWN set user-data/yterm/req down\n"
+    # n/b step through related videos; Ctrl+Right/Left do the same for anyone
+    # whose terminal does not pass the plain letters through to mpv.
+    "n set user-data/yterm/req next\n"
+    "b set user-data/yterm/req prev\n"
+    "Ctrl+RIGHT set user-data/yterm/req next\n"
+    "Ctrl+LEFT set user-data/yterm/req prev\n"
 )
 # Selectable height caps for the in-terminal stream, lowest to highest.
 QUALITY_CAPS = [144, 240, 360, 480, 720, 1080]
@@ -89,7 +95,9 @@ HELP_TEXT = """\
            (a &t=90s / &t=1h2m3s timestamp starts playback there)
   Enter    stream selected video in the terminal
   a        play audio only
-  o        open in an mpv window (full quality, browse continues)
+  o        play in the reusable mpv window (replaces it) — search stays live
+  e        enqueue the selected video after the one in the window
+  x        stop the window player
   c        list the selected video's channel uploads
   n        up next — related suggestions for the selected video
   g        toggle GPU / hardware decoding (off by default)
@@ -107,13 +115,24 @@ HELP_TEXT = """\
   space    pause / resume
   ←/→       seek 5 s         ↑/↓   volume ±5%
   Ctrl+↑/↓  raise/lower quality (reloads in place)
+  n / b     next / previous related video (autoplay, reloads in place)
+            (Ctrl+→ / Ctrl+← do the same)
   m         mute             [ / ] playback speed   ,/. frame step
+
+[b]Search while playing[/b]
+  Enter takes over the terminal, so to keep searching press o to play in a
+  reusable mpv window instead. The TUI stays live: search, press n for
+  suggestions, then o on another result to swap it into the same window, or
+  e to queue it next. x stops the window. The status bar shows what is
+  playing while the window is open.
 
 [b]Up next / suggestions[/b]
   n loads related videos for the highlighted result, and when an
   in-terminal or audio video finishes its suggestions load automatically,
   YouTube autoplay style. Suggestions come from the video's mix and respect
   your sign-in. Press Enter on one to play it, or / to search afresh.
+  While a video plays in the terminal, n / b (or Ctrl+→ / Ctrl+←) jump to the
+  next or previous related video without leaving playback.
 
 [b]Quality[/b]
   The footer shows the live resolution. Ctrl+↑/↓ lower or raise the height
@@ -286,7 +305,7 @@ def fmt_views(n) -> str:
 FOOTER_ROWS = 2
 FOOTER_BG = "\x1b[48;2;40;46;66m"     # subtle blue-grey, distinct from the bg
 FOOTER_FG = "\x1b[38;2;236;236;245m"
-KEY_HINTS = "q quit · spc pause · ←/→ 5s · ↑/↓ vol · ⌃↑/↓ quality · m mute · [ ] speed"
+KEY_HINTS = "q quit · spc pause · ←/→ 5s · ↑/↓ vol · ⌃↑/↓ quality · n/b next/prev video · m mute · [ ] speed"
 
 
 def footer_margin_ratio(lines: int) -> float:
@@ -464,6 +483,8 @@ class YTerm(App):
         Binding("enter", "play_terminal", "Play", priority=False),
         Binding("a", "play_audio", "Audio"),
         Binding("o", "play_window", "Window"),
+        Binding("e", "enqueue_window", "Enqueue"),
+        Binding("x", "stop_window", "Stop win", show=False),
         Binding("c", "browse_channel", "Channel"),
         Binding("n", "related", "Up next"),
         Binding("g", "toggle_hwdec", "GPU"),
@@ -487,6 +508,12 @@ class YTerm(App):
         self.quality_cap = min(QUALITY_CAPS, key=lambda c: abs(c - cap))
         self.hwdec = bool(self.cfg.get("hwdec", False))
         self._related_cache: dict[str, list[dict]] = {}
+        # A single reusable mpv window we drive over IPC, so the TUI stays
+        # interactive for searching while a video plays (issue #5).
+        self._win_proc: subprocess.Popen | None = None
+        self._win_sock: str | None = None
+        self._win_title: str | None = None
+        self._last_video_entry: dict | None = None
 
     def compose(self) -> ComposeResult:
         yield Input(
@@ -522,7 +549,10 @@ class YTerm(App):
         if vo == "tct":
             vo += " (block art — run yterm inside kitty for sharp video, or o for a window)"
         decode = "gpu" if self.hwdec else "cpu"
-        self.set_status(f"video: {vo} ≤{TERM_MAXH}p · decode {decode} │ {auth} │ ? for all keys")
+        base = f"video: {vo} ≤{TERM_MAXH}p · decode {decode} │ {auth} │ ? for all keys"
+        if self._win_proc and self._win_proc.poll() is None and self._win_title:
+            base = f"▶ window: {self._win_title[:38]} (x stop) │ {base}"
+        self.set_status(base)
 
     def in_input(self) -> bool:
         return isinstance(self.focused, Input)
@@ -643,30 +673,31 @@ class YTerm(App):
 
     @work(thread=True, exclusive=True)
     def run_related(self, vid: str, title: str) -> None:
-        entries = self._related_cache.get(vid)
-        if entries is None:
-            entries = self._fetch_related(vid, title)
-            if entries:  # only cache a real hit, never a transient empty/fail
-                self._related_cache[vid] = entries
+        entries = self._fetch_related(vid, title)
         self.call_from_thread(self.populate, entries, f"up next · related to {title}")
 
     def _fetch_related(self, vid: str, title: str) -> list[dict]:
         """The video's RD mix first, then a title search as a fallback so
-        suggestions still appear for videos that have no mix. The seed video
-        is filtered out of both."""
-        last_err = None
+        suggestions still appear for videos that have no mix. Pure: caches per
+        video, filters the seed, and returns [] on failure with no UI side
+        effects, so it is safe to call from the playback thread too."""
+        if not vid:
+            return []
+        cached = self._related_cache.get(vid)
+        if cached is not None:
+            return cached
+        got: list[dict] = []
         for target in (related_target(vid), f"ytsearch{SEARCH_LIMIT}:{title}"):
             try:
                 got = [e for e in _flat_extract(target, self.cookies_browser)
                        if entry_video_id(e) != vid]
-            except Exception as exc:
-                last_err = str(exc).split("\n")[0][:120]
-                continue
+            except Exception:
+                got = []
             if got:
-                return got
-        if last_err:
-            self.call_from_thread(self.set_status, f"up next failed: {last_err}")
-        return []
+                break
+        if got:  # only cache a real hit, never a transient empty/fail
+            self._related_cache[vid] = got
+        return got
 
     def action_toggle_hwdec(self) -> None:
         if self.in_input():
@@ -726,6 +757,34 @@ class YTerm(App):
         if not self.in_input():
             self._play("window")
 
+    def action_enqueue_window(self) -> None:
+        if self.in_input():
+            return
+        entry = self.selected_entry()
+        if entry:
+            self._window_play(entry, append=True)
+
+    def action_stop_window(self) -> None:
+        if self.in_input():
+            return
+        if self._win_proc and self._win_proc.poll() is None:
+            if self._win_sock:
+                try:
+                    ipc = MpvIPC(self._win_sock)
+                    ipc.command(["quit"])
+                    ipc.close()
+                except OSError:
+                    pass
+            try:
+                self._win_proc.wait(timeout=3)
+            except Exception:
+                self._win_proc.terminate()
+            self.set_status("stopped the window player")
+        else:
+            self.set_status("no window player is running")
+        self._win_proc = self._win_sock = self._win_title = None
+        self.refresh_idle_status()
+
     def _mpv_base(self) -> list[str] | None:
         mpv = shutil.which("mpv")
         if not mpv:
@@ -749,6 +808,78 @@ class YTerm(App):
         if self.hwdec:
             return ["--hwdec=auto-safe"]
         return ["--profile=sw-fast"]
+
+    # -- reusable window player (search while playing, issue #5) -----------
+
+    def _window_play(self, entry: dict, append: bool = False) -> None:
+        """Play in a single reusable mpv window. If one is already running we
+        drive it over IPC (replace, or append-play to queue) so the search box
+        stays available; otherwise we spawn the window."""
+        url = entry["url"]
+        title = entry.get("title") or url
+        start = int(entry.get("start") or 0)
+        if self._win_proc and self._win_proc.poll() is None and \
+                self._window_loadfile(url, start, append):
+            if not append:
+                self._win_title = title
+            verb = "queued" if append else "now playing"
+            self.set_status(f"{verb} in window: {title[:55]} — keep searching, the TUI stays live")
+            return
+        self._spawn_window(url, title, start)
+
+    def _window_loadfile(self, url: str, start: int, append: bool) -> bool:
+        """Tell the running window to load a URL. Returns False if it could
+        not be reached, so the caller can spawn a fresh window instead."""
+        sock = self._win_sock
+        if not sock:
+            return False
+        mode = "append-play" if append else "replace"
+        deadline = time.time() + 1.5  # the socket may lag a just-spawned mpv
+        while time.time() < deadline:
+            if os.path.exists(sock):
+                try:
+                    ipc = MpvIPC(sock)
+                except OSError:
+                    time.sleep(0.1)
+                    continue
+                args = ["loadfile", url, mode]
+                if start:
+                    args.append(f"start={start}")  # 3rd arg is options on mpv <= 0.37
+                ipc.command(args)
+                ipc.close()
+                return True
+            time.sleep(0.1)
+        return False
+
+    def _spawn_window(self, url: str, title: str, start: int) -> None:
+        cmd = self._mpv_base()
+        if cmd is None:
+            return
+        sock = os.path.join(tempfile.gettempdir(), f"yterm-window-{os.getpid()}.sock")
+        try:
+            os.unlink(sock)
+        except OSError:
+            pass
+        if self.hwdec:
+            cmd.append("--hwdec=auto-safe")
+        cmd += [
+            "--idle=yes", "--force-window=yes",  # persist as a player between videos
+            f"--input-ipc-server={sock}",
+            "--title=yterm ▶ ${media-title}",
+            f"--ytdl-format=bestvideo[height<={WINDOW_MAXH}]+bestaudio"
+            f"/best[height<={WINDOW_MAXH}]/best",
+        ]
+        if start:
+            cmd.append(f"--start={start}")
+        cmd.append(url)
+        self._win_proc = subprocess.Popen(
+            cmd, start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        self._win_sock = sock
+        self._win_title = title
+        self.set_status(f"now playing in window: {title[:55]} — keep searching, the TUI stays live")
 
     def _print_control_centre(self, title: str, mode_desc: str) -> None:
         cols = shutil.get_terminal_size().columns
@@ -776,20 +907,7 @@ class YTerm(App):
             cmd.append(f"--start={start}")
 
         if mode == "window":
-            if self.hwdec:
-                cmd.append("--hwdec=auto-safe")
-            cmd += [
-                f"--ytdl-format=bestvideo[height<={WINDOW_MAXH}]+bestaudio"
-                f"/best[height<={WINDOW_MAXH}]/best",
-                f"--title=yterm: {title}",
-                url,
-            ]
-            subprocess.Popen(
-                cmd, start_new_session=True,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-            self.set_status(f"playing in window: {title[:60]} (browse continues)")
+            self._window_play(entry)
             return
 
         if mode == "audio":
@@ -816,16 +934,18 @@ class YTerm(App):
 
         # Video: a coloured control footer mpv can't overdraw (issue #1), with
         # a live resolution readout and a Ctrl+Up/Down quality toggle (issue #2).
+        self._last_video_entry = entry
         try:
             with self.suspend():
                 os.system("clear")
                 try:
-                    self._play_video_with_footer(url, title, start)
+                    self._play_video_with_footer(entry, start)
                 except KeyboardInterrupt:
                     pass
         finally:
-            self.set_status(f"finished: {title[:60]}")
-            self.load_related(entry)
+            last = self._last_video_entry or entry
+            self.set_status(f"finished: {(last.get('title') or title)[:60]}")
+            self.load_related(last)
 
     def _video_cmd(self, url: str, cap: int, start: int, sock: str) -> list[str] | None:
         cmd = self._mpv_base()
@@ -861,13 +981,17 @@ class YTerm(App):
             self.cfg["quality_cap"] = self.quality_cap
             save_config(self.cfg)
 
-    def _play_video_with_footer(self, url: str, title: str, start: int) -> None:
+    def _play_video_with_footer(self, entry: dict, start: int) -> None:
         """Launch mpv with a control footer it cannot overdraw, a live
-        resolution readout, and a Ctrl+Up/Down quality toggle that reloads
-        the stream at the new cap while preserving the playback position."""
+        resolution readout, a Ctrl+Up/Down quality toggle that reloads the
+        stream while preserving position, and Ctrl+Left/Right to step through
+        an in-terminal queue of related videos (autoplay, issue #4/#5)."""
         sock = os.path.join(tempfile.gettempdir(), f"yterm-mpv-{os.getpid()}.sock")
+        queue = [entry]   # current video plus any related ones pulled in by 'next'
+        idx = 0
+        self._last_video_entry = entry
 
-        def launch(cap: int, pos: float):
+        def launch(url: str, cap: int, pos: float):
             try:
                 os.unlink(sock)
             except OSError:
@@ -890,7 +1014,17 @@ class YTerm(App):
                 time.sleep(0.15)
             return proc, ipc
 
-        proc, ipc = launch(self.quality_cap, start)
+        def extend_queue():
+            """Append this video's still-unseen related videos to the queue."""
+            seed = queue[idx]
+            sugg = self._fetch_related(entry_video_id(seed), seed.get("title") or "")
+            seen = {entry_video_id(q) for q in queue}
+            for s in sugg:
+                if entry_video_id(s) not in seen:
+                    queue.append(s)
+                    seen.add(entry_video_id(s))
+
+        proc, ipc = launch(queue[idx]["url"], self.quality_cap, start)
         props = ("time-pos", "duration", "percent-pos", "volume", "pause", "width", "height")
         last_lines = None
         try:
@@ -904,6 +1038,7 @@ class YTerm(App):
                     last_lines = size.lines
                 st = {p: ipc.get(p) for p in props} if ipc else {}
                 req = ipc.get("user-data/yterm/req") if ipc else None
+
                 if req in ("up", "down"):
                     if ipc:
                         ipc.command(["set_property", "user-data/yterm/req", "none"])
@@ -918,10 +1053,33 @@ class YTerm(App):
                             proc.wait(timeout=5)
                         except subprocess.TimeoutExpired:
                             proc.kill()
-                        proc, ipc = launch(new_cap, pos)
+                        proc, ipc = launch(queue[idx]["url"], new_cap, pos)
                         last_lines = None  # new mpv: re-push the margin
                     continue
+
+                if req in ("next", "prev"):
+                    if ipc:
+                        ipc.command(["set_property", "user-data/yterm/req", "none"])
+                    if req == "next" and idx + 1 >= len(queue):
+                        draw_footer([" loading up next…", " " + KEY_HINTS], size.lines, size.columns)
+                        extend_queue()
+                    target = idx + 1 if req == "next" else idx - 1
+                    if 0 <= target < len(queue):
+                        idx = target
+                        self._last_video_entry = queue[idx]
+                        if ipc:
+                            ipc.close()
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                        proc, ipc = launch(queue[idx]["url"], self.quality_cap, 0)
+                        last_lines = None
+                    continue
+
                 st["cap"] = self.quality_cap
+                title = queue[idx].get("title") or queue[idx]["url"]
                 draw_footer(footer_lines(st, title, size.columns), size.lines, size.columns)
                 time.sleep(0.25)
         except (BrokenPipeError, OSError):

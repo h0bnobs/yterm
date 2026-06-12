@@ -18,7 +18,9 @@ yterm
 | `↑`/`↓` | Move through results                                    |
 | `Enter` | Stream selected video in the terminal                   |
 | `a`     | Play audio only                                         |
-| `o`     | Open in an mpv window — full quality, browsing continues|
+| `o`     | Play in the reusable mpv window (replaces it) — search stays live |
+| `e`     | Enqueue the selected video after the one in the window  |
+| `x`     | Stop the window player                                  |
 | `c`     | Browse the selected video's channel uploads             |
 | `n`     | Up next — related suggestions for the selected video    |
 | `g`     | Toggle GPU / hardware decoding (off by default)         |
@@ -48,9 +50,15 @@ Any `http(s)` URL yt-dlp supports will play, not just YouTube.
 ## Playback control centre
 
 During playback the video fills the pane from the top and a constantly
-redrawn control bar sits directly under it: position / duration / volume
-plus the key hints (`q` quit, `space` pause, `←/→` seek 5 s, `↑/↓` seek
-1 min, `9/0` volume, `m` mute, `[ ]` speed).
+redrawn control bar sits directly under it, showing position / duration,
+volume and the live resolution. Key hints: `q` quit, `space` pause, `←/→`
+seek 5 s, `↑/↓` volume ±5%, `Ctrl+↑/↓` lower/raise quality, `n`/`b`
+next/previous related video, `m` mute, `[ ]` speed.
+
+`n` / `b` are autoplay without leaving the terminal: `n` jumps to the next
+related video (pulled from the current video's suggestions) and `b` steps
+back, each reloading in place at your chosen quality. `Ctrl+→` / `Ctrl+←`
+do the same, for terminals that intercept the plain letters.
 
 ## Sign in
 
@@ -73,6 +81,22 @@ graphics protocol, full pixel resolution) when running in kitty, otherwise
 For sharp video, run yterm inside kitty, or press `o` on any video for a real
 mpv window at up to 1080p. In-terminal streams fetch up to 720p
 (`YTERM_MAXHEIGHT` to change).
+
+## Search while playing
+
+Pressing `Enter` streams a video in the terminal, which takes over the screen
+until it ends. To keep browsing while you watch, press `o` instead: it plays in
+a single reusable mpv window and leaves the TUI fully interactive. Search for
+something else, press `n` for suggestions, then press `o` on another result to
+swap it into the same window, or `e` to queue it up next. `x` stops the window
+player, and the status bar shows what the window is playing while it is open.
+
+This windowed player also runs at up to 1080p and obeys the GPU decoding
+toggle, so it doubles as the high-quality way to watch.
+
+If you would rather stay in the terminal, in-terminal playback has its own
+autoplay: while a video plays, `n` and `b` (or `Ctrl+→` / `Ctrl+←`) step
+through its related videos in place without returning to the browser.
 
 ## Up next / suggestions
 
