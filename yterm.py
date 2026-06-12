@@ -111,6 +111,7 @@ HELP_TEXT = """\
   space    pause / resume
   ←/→       seek 5 s         ↑/↓   volume ±5%
   Ctrl+↑/↓  raise/lower quality (reloads in place)
+  Ctrl+←/→  previous / next related video (autoplay, reloads in place)
   m         mute             [ / ] playback speed   ,/. frame step
 
 [b]Search while playing[/b]
@@ -125,6 +126,8 @@ HELP_TEXT = """\
   in-terminal or audio video finishes its suggestions load automatically,
   YouTube autoplay style. Suggestions come from the video's mix and respect
   your sign-in. Press Enter on one to play it, or / to search afresh.
+  While a video plays in the terminal, Ctrl+→ / Ctrl+← jump to the next or
+  previous related video without leaving playback.
 
 [b]Quality[/b]
   The footer shows the live resolution. Ctrl+↑/↓ lower or raise the height
