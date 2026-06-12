@@ -40,6 +40,8 @@ INPUT_CONF = (
     "DOWN add volume -5\n"
     "Ctrl+UP set user-data/yterm/req up\n"
     "Ctrl+DOWN set user-data/yterm/req down\n"
+    "Ctrl+RIGHT set user-data/yterm/req next\n"
+    "Ctrl+LEFT set user-data/yterm/req prev\n"
 )
 # Selectable height caps for the in-terminal stream, lowest to highest.
 QUALITY_CAPS = [144, 240, 360, 480, 720, 1080]
@@ -662,30 +664,31 @@ class YTerm(App):
 
     @work(thread=True, exclusive=True)
     def run_related(self, vid: str, title: str) -> None:
-        entries = self._related_cache.get(vid)
-        if entries is None:
-            entries = self._fetch_related(vid, title)
-            if entries:  # only cache a real hit, never a transient empty/fail
-                self._related_cache[vid] = entries
+        entries = self._fetch_related(vid, title)
         self.call_from_thread(self.populate, entries, f"up next · related to {title}")
 
     def _fetch_related(self, vid: str, title: str) -> list[dict]:
         """The video's RD mix first, then a title search as a fallback so
-        suggestions still appear for videos that have no mix. The seed video
-        is filtered out of both."""
-        last_err = None
+        suggestions still appear for videos that have no mix. Pure: caches per
+        video, filters the seed, and returns [] on failure with no UI side
+        effects, so it is safe to call from the playback thread too."""
+        if not vid:
+            return []
+        cached = self._related_cache.get(vid)
+        if cached is not None:
+            return cached
+        got: list[dict] = []
         for target in (related_target(vid), f"ytsearch{SEARCH_LIMIT}:{title}"):
             try:
                 got = [e for e in _flat_extract(target, self.cookies_browser)
                        if entry_video_id(e) != vid]
-            except Exception as exc:
-                last_err = str(exc).split("\n")[0][:120]
-                continue
+            except Exception:
+                got = []
             if got:
-                return got
-        if last_err:
-            self.call_from_thread(self.set_status, f"up next failed: {last_err}")
-        return []
+                break
+        if got:  # only cache a real hit, never a transient empty/fail
+            self._related_cache[vid] = got
+        return got
 
     def action_toggle_hwdec(self) -> None:
         if self.in_input():
