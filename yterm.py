@@ -464,6 +464,8 @@ class YTerm(App):
         Binding("enter", "play_terminal", "Play", priority=False),
         Binding("a", "play_audio", "Audio"),
         Binding("o", "play_window", "Window"),
+        Binding("e", "enqueue_window", "Enqueue"),
+        Binding("x", "stop_window", "Stop win", show=False),
         Binding("c", "browse_channel", "Channel"),
         Binding("n", "related", "Up next"),
         Binding("g", "toggle_hwdec", "GPU"),
@@ -527,7 +529,10 @@ class YTerm(App):
         if vo == "tct":
             vo += " (block art — run yterm inside kitty for sharp video, or o for a window)"
         decode = "gpu" if self.hwdec else "cpu"
-        self.set_status(f"video: {vo} ≤{TERM_MAXH}p · decode {decode} │ {auth} │ ? for all keys")
+        base = f"video: {vo} ≤{TERM_MAXH}p · decode {decode} │ {auth} │ ? for all keys"
+        if self._win_proc and self._win_proc.poll() is None and self._win_title:
+            base = f"▶ window: {self._win_title[:38]} (x stop) │ {base}"
+        self.set_status(base)
 
     def in_input(self) -> bool:
         return isinstance(self.focused, Input)
@@ -730,6 +735,34 @@ class YTerm(App):
     def action_play_window(self) -> None:
         if not self.in_input():
             self._play("window")
+
+    def action_enqueue_window(self) -> None:
+        if self.in_input():
+            return
+        entry = self.selected_entry()
+        if entry:
+            self._window_play(entry, append=True)
+
+    def action_stop_window(self) -> None:
+        if self.in_input():
+            return
+        if self._win_proc and self._win_proc.poll() is None:
+            if self._win_sock:
+                try:
+                    ipc = MpvIPC(self._win_sock)
+                    ipc.command(["quit"])
+                    ipc.close()
+                except OSError:
+                    pass
+            try:
+                self._win_proc.wait(timeout=3)
+            except Exception:
+                self._win_proc.terminate()
+            self.set_status("stopped the window player")
+        else:
+            self.set_status("no window player is running")
+        self._win_proc = self._win_sock = self._win_title = None
+        self.refresh_idle_status()
 
     def _mpv_base(self) -> list[str] | None:
         mpv = shutil.which("mpv")
