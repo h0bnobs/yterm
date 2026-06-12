@@ -785,6 +785,7 @@ class YTerm(App):
                 except KeyboardInterrupt:
                     pass
             self.set_status(f"finished: {title[:60]}")
+            self.load_related(entry)
             return
 
         # Video: a coloured control footer mpv can't overdraw (issue #1), with
@@ -796,6 +797,7 @@ class YTerm(App):
             except KeyboardInterrupt:
                 pass
         self.set_status(f"finished: {title[:60]}")
+        self.load_related(entry)
 
     def _video_cmd(self, url: str, cap: int, start: int, sock: str) -> list[str] | None:
         cmd = self._mpv_base()
