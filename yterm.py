@@ -429,6 +429,7 @@ class YTerm(App):
         self.cookies_browser: str | None = self.cfg.get("cookies_browser")
         cap = int(self.cfg.get("quality_cap", TERM_MAXH))
         self.quality_cap = min(QUALITY_CAPS, key=lambda c: abs(c - cap))
+        self.hwdec = bool(self.cfg.get("hwdec", False))
 
     def compose(self) -> ComposeResult:
         yield Input(
@@ -621,6 +622,14 @@ class YTerm(App):
             cmd.append(f"--ytdl-raw-options-append=cookies-from-browser={self.cookies_browser}")
         return cmd
 
+    def _decode_flags(self) -> list[str]:
+        """Decode/scale flags shared by the video paths. With GPU decoding on
+        we let mpv pick a safe hardware decoder; otherwise the fast software
+        profile keeps CPU scaling cheap for terminal output."""
+        if self.hwdec:
+            return ["--hwdec=auto-safe"]
+        return ["--profile=sw-fast"]
+
     def _print_control_centre(self, title: str, mode_desc: str) -> None:
         cols = shutil.get_terminal_size().columns
         bar = "─" * min(cols - 1, 110)
@@ -647,6 +656,8 @@ class YTerm(App):
             cmd.append(f"--start={start}")
 
         if mode == "window":
+            if self.hwdec:
+                cmd.append("--hwdec=auto-safe")
             cmd += [
                 f"--ytdl-format=bestvideo[height<={WINDOW_MAXH}]+bestaudio"
                 f"/best[height<={WINDOW_MAXH}]/best",
@@ -698,13 +709,13 @@ class YTerm(App):
         ratio = FOOTER_ROWS / max(lines, FOOTER_ROWS + 1)
         cmd += [
             f"--vo={self.vo}",
-            "--profile=sw-fast",
             "--term-status-msg=",
             f"--input-ipc-server={sock}",
             f"--video-margin-ratio-bottom={ratio:.4f}",
             f"--ytdl-format=bestvideo[height<={cap}]+bestaudio"
             f"/best[height<={cap}]/best",
         ]
+        cmd += self._decode_flags()
         if self.vo == "kitty":
             cmd.append("--vo-kitty-use-shm=yes")
         if start:
