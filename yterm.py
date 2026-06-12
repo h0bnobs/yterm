@@ -297,7 +297,7 @@ def fmt_views(n) -> str:
 FOOTER_ROWS = 2
 FOOTER_BG = "\x1b[48;2;40;46;66m"     # subtle blue-grey, distinct from the bg
 FOOTER_FG = "\x1b[38;2;236;236;245m"
-KEY_HINTS = "q quit · spc pause · ←/→ 5s · ↑/↓ vol · ⌃↑/↓ quality · m mute · [ ] speed"
+KEY_HINTS = "q quit · spc pause · ←/→ 5s · ↑/↓ vol · ⌃↑/↓ quality · ⌃←/→ prev/next · m mute · [ ] speed"
 
 
 def footer_margin_ratio(lines: int) -> float:
@@ -505,6 +505,7 @@ class YTerm(App):
         self._win_proc: subprocess.Popen | None = None
         self._win_sock: str | None = None
         self._win_title: str | None = None
+        self._last_video_entry: dict | None = None
 
     def compose(self) -> ComposeResult:
         yield Input(
@@ -925,16 +926,18 @@ class YTerm(App):
 
         # Video: a coloured control footer mpv can't overdraw (issue #1), with
         # a live resolution readout and a Ctrl+Up/Down quality toggle (issue #2).
+        self._last_video_entry = entry
         try:
             with self.suspend():
                 os.system("clear")
                 try:
-                    self._play_video_with_footer(url, title, start)
+                    self._play_video_with_footer(entry, start)
                 except KeyboardInterrupt:
                     pass
         finally:
-            self.set_status(f"finished: {title[:60]}")
-            self.load_related(entry)
+            last = self._last_video_entry or entry
+            self.set_status(f"finished: {(last.get('title') or title)[:60]}")
+            self.load_related(last)
 
     def _video_cmd(self, url: str, cap: int, start: int, sock: str) -> list[str] | None:
         cmd = self._mpv_base()
@@ -970,13 +973,17 @@ class YTerm(App):
             self.cfg["quality_cap"] = self.quality_cap
             save_config(self.cfg)
 
-    def _play_video_with_footer(self, url: str, title: str, start: int) -> None:
+    def _play_video_with_footer(self, entry: dict, start: int) -> None:
         """Launch mpv with a control footer it cannot overdraw, a live
-        resolution readout, and a Ctrl+Up/Down quality toggle that reloads
-        the stream at the new cap while preserving the playback position."""
+        resolution readout, a Ctrl+Up/Down quality toggle that reloads the
+        stream while preserving position, and Ctrl+Left/Right to step through
+        an in-terminal queue of related videos (autoplay, issue #4/#5)."""
         sock = os.path.join(tempfile.gettempdir(), f"yterm-mpv-{os.getpid()}.sock")
+        queue = [entry]   # current video plus any related ones pulled in by 'next'
+        idx = 0
+        self._last_video_entry = entry
 
-        def launch(cap: int, pos: float):
+        def launch(url: str, cap: int, pos: float):
             try:
                 os.unlink(sock)
             except OSError:
@@ -999,7 +1006,17 @@ class YTerm(App):
                 time.sleep(0.15)
             return proc, ipc
 
-        proc, ipc = launch(self.quality_cap, start)
+        def extend_queue():
+            """Append this video's still-unseen related videos to the queue."""
+            seed = queue[idx]
+            sugg = self._fetch_related(entry_video_id(seed), seed.get("title") or "")
+            seen = {entry_video_id(q) for q in queue}
+            for s in sugg:
+                if entry_video_id(s) not in seen:
+                    queue.append(s)
+                    seen.add(entry_video_id(s))
+
+        proc, ipc = launch(queue[idx]["url"], self.quality_cap, start)
         props = ("time-pos", "duration", "percent-pos", "volume", "pause", "width", "height")
         last_lines = None
         try:
@@ -1013,6 +1030,7 @@ class YTerm(App):
                     last_lines = size.lines
                 st = {p: ipc.get(p) for p in props} if ipc else {}
                 req = ipc.get("user-data/yterm/req") if ipc else None
+
                 if req in ("up", "down"):
                     if ipc:
                         ipc.command(["set_property", "user-data/yterm/req", "none"])
@@ -1027,10 +1045,33 @@ class YTerm(App):
                             proc.wait(timeout=5)
                         except subprocess.TimeoutExpired:
                             proc.kill()
-                        proc, ipc = launch(new_cap, pos)
+                        proc, ipc = launch(queue[idx]["url"], new_cap, pos)
                         last_lines = None  # new mpv: re-push the margin
                     continue
+
+                if req in ("next", "prev"):
+                    if ipc:
+                        ipc.command(["set_property", "user-data/yterm/req", "none"])
+                    if req == "next" and idx + 1 >= len(queue):
+                        draw_footer([" loading up next…", " " + KEY_HINTS], size.lines, size.columns)
+                        extend_queue()
+                    target = idx + 1 if req == "next" else idx - 1
+                    if 0 <= target < len(queue):
+                        idx = target
+                        self._last_video_entry = queue[idx]
+                        if ipc:
+                            ipc.close()
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                        proc, ipc = launch(queue[idx]["url"], self.quality_cap, 0)
+                        last_lines = None
+                    continue
+
                 st["cap"] = self.quality_cap
+                title = queue[idx].get("title") or queue[idx]["url"]
                 draw_footer(footer_lines(st, title, size.columns), size.lines, size.columns)
                 time.sleep(0.25)
         except (BrokenPipeError, OSError):
