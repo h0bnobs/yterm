@@ -91,6 +91,7 @@ HELP_TEXT = """\
   a        play audio only
   o        open in an mpv window (full quality, browse continues)
   c        list the selected video's channel uploads
+  g        toggle GPU / hardware decoding (off by default)
   s        sign in / out (browser cookies)
   u        subscriptions feed        (signed in)
   r        recommended feed          (signed in)
@@ -111,6 +112,13 @@ HELP_TEXT = """\
   The footer shows the live resolution. Ctrl+↑/↓ lower or raise the height
   cap (144-1080p) and reload in place, keeping your position; the choice is
   remembered next time. Press o for a full-quality mpv window.
+
+[b]GPU / hardware decoding[/b]
+  g toggles hardware decoding (--hwdec=auto-safe) on or off; the choice is
+  remembered. It lowers CPU during decode and helps the o window most. For
+  in-terminal video the frames still copy back to the CPU to be drawn, so
+  the gain there is smaller. Off by default — turn it on if playback is
+  choppy or CPU runs hot.
 """
 
 
