@@ -645,17 +645,28 @@ class YTerm(App):
     def run_related(self, vid: str, title: str) -> None:
         entries = self._related_cache.get(vid)
         if entries is None:
-            try:
-                entries = _flat_extract(related_target(vid), self.cookies_browser)
-            except Exception as exc:
-                msg = str(exc).split("\n")[0][:120]
-                self.call_from_thread(self.set_status, f"up next failed: {msg}")
-                self.call_from_thread(setattr, self.query_one(DataTable), "loading", False)
-                return
-            # The mix is seeded by the video itself — drop it from suggestions.
-            entries = [e for e in entries if entry_video_id(e) != vid]
-            self._related_cache[vid] = entries
+            entries = self._fetch_related(vid, title)
+            if entries:  # only cache a real hit, never a transient empty/fail
+                self._related_cache[vid] = entries
         self.call_from_thread(self.populate, entries, f"up next · related to {title}")
+
+    def _fetch_related(self, vid: str, title: str) -> list[dict]:
+        """The video's RD mix first, then a title search as a fallback so
+        suggestions still appear for videos that have no mix. The seed video
+        is filtered out of both."""
+        last_err = None
+        for target in (related_target(vid), f"ytsearch{SEARCH_LIMIT}:{title}"):
+            try:
+                got = [e for e in _flat_extract(target, self.cookies_browser)
+                       if entry_video_id(e) != vid]
+            except Exception as exc:
+                last_err = str(exc).split("\n")[0][:120]
+                continue
+            if got:
+                return got
+        if last_err:
+            self.call_from_thread(self.set_status, f"up next failed: {last_err}")
+        return []
 
     def action_toggle_hwdec(self) -> None:
         if self.in_input():
@@ -790,27 +801,31 @@ class YTerm(App):
             if self.cookies_browser:
                 mode_desc += f" │ signed in: {self.auth_label()}"
             cmd.append(url)
-            with self.suspend():
-                os.system("clear")
-                self._print_control_centre(title, mode_desc)
-                try:
-                    subprocess.call(cmd)
-                except KeyboardInterrupt:
-                    pass
-            self.set_status(f"finished: {title[:60]}")
-            self.load_related(entry)
+            try:
+                with self.suspend():
+                    os.system("clear")
+                    self._print_control_centre(title, mode_desc)
+                    try:
+                        subprocess.call(cmd)
+                    except KeyboardInterrupt:
+                        pass
+            finally:
+                self.set_status(f"finished: {title[:60]}")
+                self.load_related(entry)
             return
 
         # Video: a coloured control footer mpv can't overdraw (issue #1), with
         # a live resolution readout and a Ctrl+Up/Down quality toggle (issue #2).
-        with self.suspend():
-            os.system("clear")
-            try:
-                self._play_video_with_footer(url, title, start)
-            except KeyboardInterrupt:
-                pass
-        self.set_status(f"finished: {title[:60]}")
-        self.load_related(entry)
+        try:
+            with self.suspend():
+                os.system("clear")
+                try:
+                    self._play_video_with_footer(url, title, start)
+                except KeyboardInterrupt:
+                    pass
+        finally:
+            self.set_status(f"finished: {title[:60]}")
+            self.load_related(entry)
 
     def _video_cmd(self, url: str, cap: int, start: int, sock: str) -> list[str] | None:
         cmd = self._mpv_base()
