@@ -91,6 +91,7 @@ HELP_TEXT = """\
   a        play audio only
   o        open in an mpv window (full quality, browse continues)
   c        list the selected video's channel uploads
+  n        up next — related suggestions for the selected video
   g        toggle GPU / hardware decoding (off by default)
   s        sign in / out (browser cookies)
   u        subscriptions feed        (signed in)
@@ -107,6 +108,12 @@ HELP_TEXT = """\
   ←/→       seek 5 s         ↑/↓   volume ±5%
   Ctrl+↑/↓  raise/lower quality (reloads in place)
   m         mute             [ / ] playback speed   ,/. frame step
+
+[b]Up next / suggestions[/b]
+  n loads related videos for the highlighted result, and when an
+  in-terminal or audio video finishes its suggestions load automatically,
+  YouTube autoplay style. Suggestions come from the video's mix and respect
+  your sign-in. Press Enter on one to play it, or / to search afresh.
 
 [b]Quality[/b]
   The footer shows the live resolution. Ctrl+↑/↓ lower or raise the height
@@ -185,6 +192,39 @@ def is_url(text: str) -> bool:
     return text.startswith("http://") or text.startswith("https://")
 
 
+def parse_video_id(url_or_id: str) -> str | None:
+    """Best-effort YouTube video id from a bare id or a watch / youtu.be /
+    shorts / embed URL. Returns None for anything that isn't recognisably
+    a YouTube video (related suggestions are a YouTube feature)."""
+    if not url_or_id:
+        return None
+    if re.fullmatch(r"[\w-]{11}", url_or_id):
+        return url_or_id
+    parsed = urllib.parse.urlparse(url_or_id)
+    host = parsed.netloc.lower()
+    if host.endswith("youtu.be"):
+        seg = parsed.path.lstrip("/").split("/")[0]
+        return seg if re.fullmatch(r"[\w-]{11}", seg) else None
+    if "youtube" in host:
+        v = urllib.parse.parse_qs(parsed.query).get("v")
+        if v and re.fullmatch(r"[\w-]{11}", v[0]):
+            return v[0]
+        m = re.search(r"/(?:shorts|embed)/([\w-]{11})", parsed.path)
+        if m:
+            return m.group(1)
+    return None
+
+
+def entry_video_id(entry: dict) -> str | None:
+    return parse_video_id(entry.get("id") or "") or parse_video_id(entry.get("url") or "")
+
+
+def related_target(vid: str) -> str:
+    """YouTube's RD 'mix'/radio playlist seeded by a video is a reliable
+    source of related suggestions via a fast flat extract."""
+    return f"https://www.youtube.com/watch?v={vid}&list=RD{vid}"
+
+
 def parse_time_token(v: str) -> int:
     """'1322', '1322s', '22m2s', '1h2m3s', '01:23', '1:02:03' -> seconds."""
     v = v.strip()
@@ -247,6 +287,12 @@ FOOTER_ROWS = 2
 FOOTER_BG = "\x1b[48;2;40;46;66m"     # subtle blue-grey, distinct from the bg
 FOOTER_FG = "\x1b[38;2;236;236;245m"
 KEY_HINTS = "q quit · spc pause · ←/→ 5s · ↑/↓ vol · ⌃↑/↓ quality · m mute · [ ] speed"
+
+
+def footer_margin_ratio(lines: int) -> float:
+    """Fraction of the video area to reserve so the footer's rows stay clear.
+    Recomputed from the live terminal height so a resize keeps it exact."""
+    return round(FOOTER_ROWS / max(lines, FOOTER_ROWS + 1), 4)
 
 
 def footer_lines(st: dict, title: str, cols: int) -> list[str]:
@@ -419,6 +465,7 @@ class YTerm(App):
         Binding("a", "play_audio", "Audio"),
         Binding("o", "play_window", "Window"),
         Binding("c", "browse_channel", "Channel"),
+        Binding("n", "related", "Up next"),
         Binding("g", "toggle_hwdec", "GPU"),
         Binding("s", "sign_in", "Sign in"),
         Binding("u", "feed('subscriptions')", "Subs", show=False),
@@ -439,6 +486,7 @@ class YTerm(App):
         cap = int(self.cfg.get("quality_cap", TERM_MAXH))
         self.quality_cap = min(QUALITY_CAPS, key=lambda c: abs(c - cap))
         self.hwdec = bool(self.cfg.get("hwdec", False))
+        self._related_cache: dict[str, list[dict]] = {}
 
     def compose(self) -> ComposeResult:
         yield Input(
@@ -500,7 +548,7 @@ class YTerm(App):
             )
         table.loading = False
         if entries:
-            self.set_status(f"{len(entries)} results · {context} │ Enter play · a audio · o window · ? keys")
+            self.set_status(f"{len(entries)} results · {context} │ Enter play · a audio · o window · n up next · ? keys")
             table.focus()
         else:
             self.set_status(f"no results for {context}")
@@ -572,6 +620,53 @@ class YTerm(App):
             self.set_status("no channel link on this result")
             return
         self.start_load(url.rstrip("/") + "/videos", f"channel {name}")
+
+    # -- suggestions / up next ---------------------------------------------
+
+    def action_related(self) -> None:
+        if self.in_input():
+            return
+        entry = self.selected_entry()
+        if entry:
+            self.load_related(entry)
+
+    def load_related(self, entry: dict) -> None:
+        """Load related suggestions for a video into the results list."""
+        vid = entry_video_id(entry)
+        if not vid:
+            self.set_status("no suggestions available for this item")
+            return
+        title = (entry.get("title") or "this video")[:50]
+        self.query_one(DataTable).loading = True
+        self.set_status(f"loading up next · {title}…")
+        self.run_related(vid, title)
+
+    @work(thread=True, exclusive=True)
+    def run_related(self, vid: str, title: str) -> None:
+        entries = self._related_cache.get(vid)
+        if entries is None:
+            entries = self._fetch_related(vid, title)
+            if entries:  # only cache a real hit, never a transient empty/fail
+                self._related_cache[vid] = entries
+        self.call_from_thread(self.populate, entries, f"up next · related to {title}")
+
+    def _fetch_related(self, vid: str, title: str) -> list[dict]:
+        """The video's RD mix first, then a title search as a fallback so
+        suggestions still appear for videos that have no mix. The seed video
+        is filtered out of both."""
+        last_err = None
+        for target in (related_target(vid), f"ytsearch{SEARCH_LIMIT}:{title}"):
+            try:
+                got = [e for e in _flat_extract(target, self.cookies_browser)
+                       if entry_video_id(e) != vid]
+            except Exception as exc:
+                last_err = str(exc).split("\n")[0][:120]
+                continue
+            if got:
+                return got
+        if last_err:
+            self.call_from_thread(self.set_status, f"up next failed: {last_err}")
+        return []
 
     def action_toggle_hwdec(self) -> None:
         if self.in_input():
@@ -706,32 +801,37 @@ class YTerm(App):
             if self.cookies_browser:
                 mode_desc += f" │ signed in: {self.auth_label()}"
             cmd.append(url)
-            with self.suspend():
-                os.system("clear")
-                self._print_control_centre(title, mode_desc)
-                try:
-                    subprocess.call(cmd)
-                except KeyboardInterrupt:
-                    pass
-            self.set_status(f"finished: {title[:60]}")
+            try:
+                with self.suspend():
+                    os.system("clear")
+                    self._print_control_centre(title, mode_desc)
+                    try:
+                        subprocess.call(cmd)
+                    except KeyboardInterrupt:
+                        pass
+            finally:
+                self.set_status(f"finished: {title[:60]}")
+                self.load_related(entry)
             return
 
         # Video: a coloured control footer mpv can't overdraw (issue #1), with
         # a live resolution readout and a Ctrl+Up/Down quality toggle (issue #2).
-        with self.suspend():
-            os.system("clear")
-            try:
-                self._play_video_with_footer(url, title, start)
-            except KeyboardInterrupt:
-                pass
-        self.set_status(f"finished: {title[:60]}")
+        try:
+            with self.suspend():
+                os.system("clear")
+                try:
+                    self._play_video_with_footer(url, title, start)
+                except KeyboardInterrupt:
+                    pass
+        finally:
+            self.set_status(f"finished: {title[:60]}")
+            self.load_related(entry)
 
     def _video_cmd(self, url: str, cap: int, start: int, sock: str) -> list[str] | None:
         cmd = self._mpv_base()
         if cmd is None:
             return None
-        lines = shutil.get_terminal_size().lines
-        ratio = FOOTER_ROWS / max(lines, FOOTER_ROWS + 1)
+        ratio = footer_margin_ratio(shutil.get_terminal_size().lines)
         cmd += [
             f"--vo={self.vo}",
             "--term-status-msg=",
@@ -792,8 +892,16 @@ class YTerm(App):
 
         proc, ipc = launch(self.quality_cap, start)
         props = ("time-pos", "duration", "percent-pos", "volume", "pause", "width", "height")
+        last_lines = None
         try:
             while proc is not None and proc.poll() is None:
+                size = shutil.get_terminal_size()
+                # Keep mpv's reserved bottom band exactly FOOTER_ROWS tall as the
+                # pane is resized, so the video can never creep over the footer.
+                if ipc and size.lines != last_lines:
+                    ipc.command(["set_property", "video-margin-ratio-bottom",
+                                 footer_margin_ratio(size.lines)])
+                    last_lines = size.lines
                 st = {p: ipc.get(p) for p in props} if ipc else {}
                 req = ipc.get("user-data/yterm/req") if ipc else None
                 if req in ("up", "down"):
@@ -811,9 +919,9 @@ class YTerm(App):
                         except subprocess.TimeoutExpired:
                             proc.kill()
                         proc, ipc = launch(new_cap, pos)
+                        last_lines = None  # new mpv: re-push the margin
                     continue
                 st["cap"] = self.quality_cap
-                size = shutil.get_terminal_size()
                 draw_footer(footer_lines(st, title, size.columns), size.lines, size.columns)
                 time.sleep(0.25)
         except (BrokenPipeError, OSError):

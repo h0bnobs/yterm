@@ -20,6 +20,7 @@ yterm
 | `a`     | Play audio only                                         |
 | `o`     | Open in an mpv window — full quality, browsing continues|
 | `c`     | Browse the selected video's channel uploads             |
+| `n`     | Up next — related suggestions for the selected video    |
 | `g`     | Toggle GPU / hardware decoding (off by default)         |
 | `s`     | Sign in / out (browser cookies or cookies.txt)          |
 | `u`     | Subscriptions feed (signed in)                          |
@@ -72,6 +73,18 @@ graphics protocol, full pixel resolution) when running in kitty, otherwise
 For sharp video, run yterm inside kitty, or press `o` on any video for a real
 mpv window at up to 1080p. In-terminal streams fetch up to 720p
 (`YTERM_MAXHEIGHT` to change).
+
+## Up next / suggestions
+
+Press `n` on any result to replace the list with related videos for it, like
+YouTube's up-next column. When an in-terminal or audio video finishes, its
+suggestions load automatically so you land on an up-next list when playback
+returns to the browser. Press Enter on a suggestion to play it, or `/` to
+start a new search.
+
+Suggestions come from the video's YouTube mix and respect your sign-in when
+cookies are present. They are cached per video for the session, so revisiting
+the same video's suggestions is instant.
 
 ## GPU / hardware decoding
 
