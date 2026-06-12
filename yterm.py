@@ -91,6 +91,7 @@ HELP_TEXT = """\
   a        play audio only
   o        open in an mpv window (full quality, browse continues)
   c        list the selected video's channel uploads
+  n        up next — related suggestions for the selected video
   g        toggle GPU / hardware decoding (off by default)
   s        sign in / out (browser cookies)
   u        subscriptions feed        (signed in)
@@ -107,6 +108,12 @@ HELP_TEXT = """\
   ←/→       seek 5 s         ↑/↓   volume ±5%
   Ctrl+↑/↓  raise/lower quality (reloads in place)
   m         mute             [ / ] playback speed   ,/. frame step
+
+[b]Up next / suggestions[/b]
+  n loads related videos for the highlighted result, and when an
+  in-terminal or audio video finishes its suggestions load automatically,
+  YouTube autoplay style. Suggestions come from the video's mix and respect
+  your sign-in. Press Enter on one to play it, or / to search afresh.
 
 [b]Quality[/b]
   The footer shows the live resolution. Ctrl+↑/↓ lower or raise the height
@@ -535,7 +542,7 @@ class YTerm(App):
             )
         table.loading = False
         if entries:
-            self.set_status(f"{len(entries)} results · {context} │ Enter play · a audio · o window · ? keys")
+            self.set_status(f"{len(entries)} results · {context} │ Enter play · a audio · o window · n up next · ? keys")
             table.focus()
         else:
             self.set_status(f"no results for {context}")
