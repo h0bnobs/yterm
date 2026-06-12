@@ -289,6 +289,12 @@ FOOTER_FG = "\x1b[38;2;236;236;245m"
 KEY_HINTS = "q quit · spc pause · ←/→ 5s · ↑/↓ vol · ⌃↑/↓ quality · m mute · [ ] speed"
 
 
+def footer_margin_ratio(lines: int) -> float:
+    """Fraction of the video area to reserve so the footer's rows stay clear.
+    Recomputed from the live terminal height so a resize keeps it exact."""
+    return round(FOOTER_ROWS / max(lines, FOOTER_ROWS + 1), 4)
+
+
 def footer_lines(st: dict, title: str, cols: int) -> list[str]:
     """The two text lines shown in the control footer."""
     icon = "⏸" if st.get("pause") else "▶"
@@ -810,8 +816,7 @@ class YTerm(App):
         cmd = self._mpv_base()
         if cmd is None:
             return None
-        lines = shutil.get_terminal_size().lines
-        ratio = FOOTER_ROWS / max(lines, FOOTER_ROWS + 1)
+        ratio = footer_margin_ratio(shutil.get_terminal_size().lines)
         cmd += [
             f"--vo={self.vo}",
             "--term-status-msg=",
@@ -872,8 +877,16 @@ class YTerm(App):
 
         proc, ipc = launch(self.quality_cap, start)
         props = ("time-pos", "duration", "percent-pos", "volume", "pause", "width", "height")
+        last_lines = None
         try:
             while proc is not None and proc.poll() is None:
+                size = shutil.get_terminal_size()
+                # Keep mpv's reserved bottom band exactly FOOTER_ROWS tall as the
+                # pane is resized, so the video can never creep over the footer.
+                if ipc and size.lines != last_lines:
+                    ipc.command(["set_property", "video-margin-ratio-bottom",
+                                 footer_margin_ratio(size.lines)])
+                    last_lines = size.lines
                 st = {p: ipc.get(p) for p in props} if ipc else {}
                 req = ipc.get("user-data/yterm/req") if ipc else None
                 if req in ("up", "down"):
@@ -891,9 +904,9 @@ class YTerm(App):
                         except subprocess.TimeoutExpired:
                             proc.kill()
                         proc, ipc = launch(new_cap, pos)
+                        last_lines = None  # new mpv: re-push the margin
                     continue
                 st["cap"] = self.quality_cap
-                size = shutil.get_terminal_size()
                 draw_footer(footer_lines(st, title, size.columns), size.lines, size.columns)
                 time.sleep(0.25)
         except (BrokenPipeError, OSError):
